@@ -25,142 +25,126 @@ import org.apache.cassandra.utils.concurrent.Ref;
 import org.apache.cassandra.utils.concurrent.WrappedSharedCloseable;
 import org.apache.cassandra.utils.obs.IBitSet;
 
-public class BloomFilter extends WrappedSharedCloseable implements IFilter
-{
-    private final static FastThreadLocal<long[]> reusableIndexes = new FastThreadLocal<long[]>()
-    {
-        protected long[] initialValue()
-        {
-            return new long[21];
-        }
-    };
+public class BloomFilter extends WrappedSharedCloseable implements IFilter {
+  private final static FastThreadLocal<long[]> reusableIndexes = new FastThreadLocal<long[]>() {
+    protected long[] initialValue() {
+      return new long[21];
+    }
+  };
 
-    public final IBitSet bitset;
-    public final int hashCount;
-    /**
-     * CASSANDRA-8413: 3.0 (inverted) bloom filters have no 'static' bits caused by using the same upper bits
-     * for both bloom filter and token distribution.
-     */
-    public final boolean oldBfHashOrder;
+  public final IBitSet bitset;
+  public final int hashCount;
+  /**
+   * CASSANDRA-8413: 3.0 (inverted) bloom filters have no 'static' bits caused by
+   * using the same upper bits for both bloom filter and token distribution.
+   */
+  public final boolean oldBfHashOrder;
 
-    BloomFilter(int hashCount, IBitSet bitset, boolean oldBfHashOrder)
-    {
-        super(bitset);
-        this.hashCount = hashCount;
-        this.bitset = bitset;
-        this.oldBfHashOrder = oldBfHashOrder;
+  BloomFilter(int hashCount, IBitSet bitset, boolean oldBfHashOrder) {
+    super(bitset);
+    this.hashCount = hashCount;
+    this.bitset = bitset;
+    this.oldBfHashOrder = oldBfHashOrder;
+  }
+
+  private BloomFilter(BloomFilter copy) {
+    super(copy);
+    this.hashCount = copy.hashCount;
+    this.bitset = copy.bitset;
+    this.oldBfHashOrder = copy.oldBfHashOrder;
+  }
+
+  public long serializedSize() {
+    return BloomFilterSerializer.serializedSize(this);
+  }
+
+  // Murmur is faster than an SHA-based approach and provides as-good collision
+  // resistance. The combinatorial generation approach described in
+  // http://www.eecs.harvard.edu/~kirsch/pubs/bbbf/esa06.pdf
+  // does prove to work in actual tests, and is obviously faster
+  // than performing further iterations of murmur.
+
+  // tests ask for ridiculous numbers of hashes so here is a special case for them
+  // rather than using the threadLocal like we do in production
+  @VisibleForTesting
+  public long[] getHashBuckets(FilterKey key, int hashCount, long max) {
+    long[] hash = new long[2];
+    key.filterHash(hash);
+    long[] indexes = new long[hashCount];
+    setIndexes(hash[1], hash[0], hashCount, max, indexes);
+    return indexes;
+  }
+
+  // note that this method uses the threadLocal that may be longer than hashCount
+  // to avoid generating a lot of garbage since stack allocation currently does
+  // not support stores
+  // (CASSANDRA-6609). it returns the array so that the caller does not need to
+  // perform
+  // a second threadlocal lookup.
+  @Inline
+  private long[] indexes(FilterKey key) {
+    // we use the same array both for storing the hash result, and for storing the
+    // indexes we return,
+    // so that we do not need to allocate two arrays.
+    long[] indexes = reusableIndexes.get();
+
+    key.filterHash(indexes);
+    setIndexes(indexes[1], indexes[0], hashCount, bitset.capacity(), indexes);
+    return indexes;
+  }
+
+  @Inline
+  private void setIndexes(long base, long inc, int count, long max, long[] results) {
+    if (oldBfHashOrder) {
+      long x = inc;
+      inc = base;
+      base = x;
     }
 
-    private BloomFilter(BloomFilter copy)
-    {
-        super(copy);
-        this.hashCount = copy.hashCount;
-        this.bitset = copy.bitset;
-        this.oldBfHashOrder = copy.oldBfHashOrder;
+    for (int i = 0; i < count; i++) {
+      results[i] = FBUtilities.abs(base % max);
+      base += inc;
     }
+  }
 
-    public long serializedSize()
-    {
-        return BloomFilterSerializer.serializedSize(this);
+  public void add(FilterKey key) {
+    long[] indexes = indexes(key);
+    for (int i = 0; i < hashCount; i++) {
+      bitset.set(indexes[i]);
     }
+  }
 
-    // Murmur is faster than an SHA-based approach and provides as-good collision
-    // resistance.  The combinatorial generation approach described in
-    // http://www.eecs.harvard.edu/~kirsch/pubs/bbbf/esa06.pdf
-    // does prove to work in actual tests, and is obviously faster
-    // than performing further iterations of murmur.
-
-    // tests ask for ridiculous numbers of hashes so here is a special case for them
-    // rather than using the threadLocal like we do in production
-    @VisibleForTesting
-    public long[] getHashBuckets(FilterKey key, int hashCount, long max)
-    {
-        long[] hash = new long[2];
-        key.filterHash(hash);
-        long[] indexes = new long[hashCount];
-        setIndexes(hash[1], hash[0], hashCount, max, indexes);
-        return indexes;
+  public final boolean isPresent(FilterKey key) {
+    long[] indexes = indexes(key);
+    for (int i = 0; i < hashCount; i++) {
+      if (!bitset.get(indexes[i])) {
+        return false;
+      }
     }
+    return true;
+  }
 
-    // note that this method uses the threadLocal that may be longer than hashCount
-    // to avoid generating a lot of garbage since stack allocation currently does not support stores
-    // (CASSANDRA-6609).  it returns the array so that the caller does not need to perform
-    // a second threadlocal lookup.
-    @Inline
-    private long[] indexes(FilterKey key)
-    {
-        // we use the same array both for storing the hash result, and for storing the indexes we return,
-        // so that we do not need to allocate two arrays.
-        long[] indexes = reusableIndexes.get();
+  public void clear() {
+    bitset.clear();
+  }
 
-        key.filterHash(indexes);
-        setIndexes(indexes[1], indexes[0], hashCount, bitset.capacity(), indexes);
-        return indexes;
-    }
+  public IFilter sharedCopy() {
+    return new BloomFilter(this);
+  }
 
-    @Inline
-    private void setIndexes(long base, long inc, int count, long max, long[] results)
-    {
-        if (oldBfHashOrder)
-        {
-            long x = inc;
-            inc = base;
-            base = x;
-        }
+  @Override
+  public long offHeapSize() {
+    return bitset.offHeapSize();
+  }
 
-        for (int i = 0; i < count; i++)
-        {
-            results[i] = FBUtilities.abs(base % max);
-            base += inc;
-        }
-    }
+  public String toString() {
+    return "BloomFilter[hashCount=" + hashCount + ";oldBfHashOrder=" + 
+            oldBfHashOrder + ";capacity=" + bitset.capacity()
+            + ']';
+  }
 
-    public void add(FilterKey key)
-    {
-        long[] indexes = indexes(key);
-        for (int i = 0; i < hashCount; i++)
-        {
-            bitset.set(indexes[i]);
-        }
-    }
-
-    public final boolean isPresent(FilterKey key)
-    {
-        long[] indexes = indexes(key);
-        for (int i = 0; i < hashCount; i++)
-        {
-            if (!bitset.get(indexes[i]))
-            {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    public void clear()
-    {
-        bitset.clear();
-    }
-
-    public IFilter sharedCopy()
-    {
-        return new BloomFilter(this);
-    }
-
-    @Override
-    public long offHeapSize()
-    {
-        return bitset.offHeapSize();
-    }
-
-    public String toString()
-    {
-        return "BloomFilter[hashCount=" + hashCount + ";oldBfHashOrder=" + oldBfHashOrder + ";capacity=" + bitset.capacity() + ']';
-    }
-
-    public void addTo(Ref.IdentityCollection identities)
-    {
-        super.addTo(identities);
-        bitset.addTo(identities);
-    }
+  public void addTo(Ref.IdentityCollection identities) {
+    super.addTo(identities);
+    bitset.addTo(identities);
+  }
 }
