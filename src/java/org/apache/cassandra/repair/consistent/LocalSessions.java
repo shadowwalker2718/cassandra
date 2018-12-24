@@ -19,10 +19,10 @@
 package org.apache.cassandra.repair.consistent;
 
 import java.io.IOException;
-import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.time.Instant;
+import java.util.Collection;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -47,21 +47,22 @@ import com.google.common.primitives.Ints;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
+
+import org.apache.cassandra.locator.RangesAtEndpoint;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.locator.Replica;
+import org.apache.cassandra.repair.KeyspaceRepairManager;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
-import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.SystemKeyspace;
-import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.db.marshal.UUIDType;
 import org.apache.cassandra.dht.IPartitioner;
@@ -81,8 +82,6 @@ import org.apache.cassandra.repair.messages.PrepareConsistentResponse;
 import org.apache.cassandra.repair.messages.RepairMessage;
 import org.apache.cassandra.repair.messages.StatusRequest;
 import org.apache.cassandra.repair.messages.StatusResponse;
-import org.apache.cassandra.schema.Schema;
-import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.service.StorageService;
@@ -547,19 +546,43 @@ public class LocalSessions
     }
 
     @VisibleForTesting
-    ListenableFuture submitPendingAntiCompaction(LocalSession session, ExecutorService executor)
+    ListenableFuture prepareSession(KeyspaceRepairManager repairManager,
+                                    UUID sessionID,
+                                    Collection<ColumnFamilyStore> tables,
+                                    RangesAtEndpoint tokenRanges,
+                                    ExecutorService executor)
     {
-        PendingAntiCompaction pac = new PendingAntiCompaction(session.sessionID, session.ranges, executor);
-        return pac.run();
+        return repairManager.prepareIncrementalRepair(sessionID, tables, tokenRanges, executor);
+    }
+
+    RangesAtEndpoint filterLocalRanges(String keyspace, Set<Range<Token>> ranges)
+    {
+        RangesAtEndpoint localRanges = StorageService.instance.getLocalReplicas(keyspace);
+        RangesAtEndpoint.Builder builder = RangesAtEndpoint.builder(localRanges.endpoint());
+        for (Range<Token> range : ranges)
+        {
+            for (Replica replica : localRanges)
+            {
+                if (replica.range().equals(range))
+                {
+                    builder.add(replica);
+                }
+                else if (replica.contains(range))
+                {
+                    builder.add(replica.decorateSubrange(range));
+                }
+            }
+
+        }
+        return builder.build();
     }
 
     /**
-     * The PrepareConsistentRequest effectively promotes the parent repair session to a consistent
-     * incremental session, and begins the 'pending anti compaction' which moves all sstable data
-     * that is to be repaired into it's own silo, preventing it from mixing with other data.
+     * The PrepareConsistentRequest promotes the parent repair session to a consistent incremental
+     * session, and isolates the data to be repaired from the rest of the table's data
      *
-     * No response is sent to the repair coordinator until the pending anti compaction has completed
-     * successfully. If the pending anti compaction fails, a failure message is sent to the coordinator,
+     * No response is sent to the repair coordinator until the data preparation / isolation has completed
+     * successfully. If the data preparation fails, a failure message is sent to the coordinator,
      * cancelling the session.
      */
     public void handlePrepareMessage(InetAddressAndPort from, PrepareConsistentRequest request)
@@ -587,8 +610,11 @@ public class LocalSessions
 
         ExecutorService executor = Executors.newFixedThreadPool(parentSession.getColumnFamilyStores().size());
 
-        ListenableFuture pendingAntiCompaction = submitPendingAntiCompaction(session, executor);
-        Futures.addCallback(pendingAntiCompaction, new FutureCallback()
+        KeyspaceRepairManager repairManager = parentSession.getKeyspace().getRepairManager();
+        RangesAtEndpoint tokenRanges = filterLocalRanges(parentSession.getKeyspace().getName(), parentSession.getRanges());
+        ListenableFuture repairPreparation = prepareSession(repairManager, sessionID, parentSession.getColumnFamilyStores(), tokenRanges, executor);
+
+        Futures.addCallback(repairPreparation, new FutureCallback<Object>()
         {
             public void onSuccess(@Nullable Object result)
             {
@@ -601,18 +627,6 @@ public class LocalSessions
             public void onFailure(Throwable t)
             {
                 logger.error("Prepare phase for incremental repair session {} failed", sessionID, t);
-                if (t instanceof PendingAntiCompaction.SSTableAcquisitionException)
-                {
-                    logger.warn("Prepare phase for incremental repair session {} was unable to " +
-                                "acquire exclusive access to the neccesary sstables. " +
-                                "This is usually caused by running multiple incremental repairs on nodes that share token ranges",
-                                sessionID);
-
-                }
-                else
-                {
-                    logger.error("Prepare phase for incremental repair session {} failed", sessionID, t);
-                }
                 sendMessage(coordinator, new PrepareConsistentResponse(sessionID, getBroadcastAddressAndPort(), false));
                 failSession(sessionID, false);
                 executor.shutdown();
@@ -673,7 +687,7 @@ public class LocalSessions
             ColumnFamilyStore cfs = Schema.instance.getColumnFamilyStoreInstance(tid);
             if (cfs != null)
             {
-                CompactionManager.instance.submitBackground(cfs);
+                cfs.getRepairManager().incrementalSessionCompleted(session.sessionID);
             }
         }
     }
@@ -767,6 +781,23 @@ public class LocalSessions
     {
         LocalSession session = getSession(sessionID);
         return session != null && session.getState() != FINALIZED && session.getState() != FAILED;
+    }
+
+    /**
+     * determines if a local session exists, and if it's in the finalized state
+     */
+    public boolean isSessionFinalized(UUID sessionID)
+    {
+        LocalSession session = getSession(sessionID);
+        return session != null && session.getState() == FINALIZED;
+    }
+
+    /**
+     * determines if a local session exists
+     */
+    public boolean sessionExists(UUID sessionID)
+    {
+        return getSession(sessionID) != null;
     }
 
     @VisibleForTesting

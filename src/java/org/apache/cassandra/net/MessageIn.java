@@ -32,6 +32,8 @@ import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.MessagingService.Verb;
+import org.apache.cassandra.utils.FBUtilities;
+
 /**
  * The receiving node's view of a {@link MessageOut}. See documentation on {@link MessageOut} for details on the
  * serialization format.
@@ -47,12 +49,12 @@ public class MessageIn<T>
     public final int version;
     public final long constructionTime;
 
-    private MessageIn(InetAddressAndPort from,
-                      T payload,
-                      Map<ParameterType, Object> parameters,
-                      Verb verb,
-                      int version,
-                      long constructionTime)
+    public MessageIn(InetAddressAndPort from,
+                     T payload,
+                     Map<ParameterType, Object> parameters,
+                     Verb verb,
+                     int version,
+                     long constructionTime)
     {
         this.from = from;
         this.payload = payload;
@@ -115,7 +117,10 @@ public class MessageIn<T>
                 {
                     byte[] value = new byte[in.readInt()];
                     in.readFully(value);
-                    builder.put(type, type.serializer.deserialize(new DataInputBuffer(value), version));
+                    try (DataInputBuffer buffer = new DataInputBuffer(value))
+                    {
+                        builder.put(type, type.serializer.deserialize(buffer, version));
+                    }
                 }
                 else
                 {
@@ -141,8 +146,14 @@ public class MessageIn<T>
             }
             serializer = (IVersionedSerializer<T2>) callback.serializer;
         }
+
         if (payloadSize == 0 || serializer == null)
+        {
+            // if there's no deserializer for the verb, skip the payload bytes to leave
+            // the stream in a clean state (for the next message)
+            in.skipBytesFully(payloadSize);
             return create(from, null, parameters, verb, version, constructionTime);
+        }
 
         T2 payload = serializer.deserialize(in, version);
         return MessageIn.create(from, payload, parameters, verb, version, constructionTime);
@@ -180,7 +191,7 @@ public class MessageIn<T>
      */
     public boolean isCrossNode()
     {
-        return !from.equals(DatabaseDescriptor.getBroadcastAddress());
+        return !from.equals(FBUtilities.getBroadcastAddressAndPort());
     }
 
     public Stage getMessageType()

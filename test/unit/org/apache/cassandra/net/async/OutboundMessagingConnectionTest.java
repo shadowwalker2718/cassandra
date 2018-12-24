@@ -20,7 +20,6 @@ package org.apache.cassandra.net.async;
 
 import java.io.IOException;
 import java.net.InetAddress;
-import java.net.InetSocketAddress;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -47,6 +46,7 @@ import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.locator.AbstractEndpointSnitch;
 import org.apache.cassandra.locator.IEndpointSnitch;
 import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.Replica;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.net.MessagingServiceTest;
@@ -88,14 +88,14 @@ public class OutboundMessagingConnectionTest
         omc.setChannelWriter(ChannelWriter.create(channel, omc::handleMessageResult, Optional.empty()));
 
         snitch = DatabaseDescriptor.getEndpointSnitch();
-        encryptionOptions = DatabaseDescriptor.getServerEncryptionOptions();
+        encryptionOptions = DatabaseDescriptor.getInternodeMessagingEncyptionOptions();
     }
 
     @After
     public void tearDown()
     {
         DatabaseDescriptor.setEndpointSnitch(snitch);
-        DatabaseDescriptor.setServerEncryptionOptions(encryptionOptions);
+        DatabaseDescriptor.setInternodeMessagingEncyptionOptions(encryptionOptions);
         channel.finishAndReleaseAll();
     }
 
@@ -173,7 +173,7 @@ public class OutboundMessagingConnectionTest
             return nodeToDc.get(endpoint);
         }
 
-        public int compareEndpoints(InetAddressAndPort target, InetAddressAndPort a1, InetAddressAndPort a2)
+        public int compareEndpoints(InetAddressAndPort target, Replica a1, Replica a2)
         {
             return 0;
         }
@@ -506,7 +506,7 @@ public class OutboundMessagingConnectionTest
         ServerEncryptionOptions encryptionOptions = new ServerEncryptionOptions();
         encryptionOptions.enabled = true;
         encryptionOptions.internode_encryption = ServerEncryptionOptions.InternodeEncryption.all;
-        DatabaseDescriptor.setServerEncryptionOptions(encryptionOptions);
+        DatabaseDescriptor.setInternodeMessagingEncyptionOptions(encryptionOptions);
         omc = new OutboundMessagingConnection(connectionId, encryptionOptions, Optional.empty(), new AllowAllInternodeAuthenticator());
         int peerVersion = MessagingService.VERSION_30;
         MessagingService.instance().setVersion(connectionId.remote(), MessagingService.VERSION_30);

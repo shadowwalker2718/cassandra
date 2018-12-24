@@ -43,8 +43,7 @@ public enum ProtocolVersion implements Comparable<ProtocolVersion>
     V2(2, "v2", false), // no longer supported
     V3(3, "v3", false),
     V4(4, "v4", false),
-    V5(5, "v5", false),
-    V6(6, "v6-beta", true);
+    V5(5, "v5-beta", true);
 
     /** The version number */
     private final int num;
@@ -63,7 +62,7 @@ public enum ProtocolVersion implements Comparable<ProtocolVersion>
     }
 
     /** The supported versions stored as an array, these should be private and are required for fast decoding*/
-    private final static ProtocolVersion[] SUPPORTED_VERSIONS = new ProtocolVersion[] { V3, V4, V5, V6 };
+    private final static ProtocolVersion[] SUPPORTED_VERSIONS = new ProtocolVersion[] { V3, V4, V5 };
     final static ProtocolVersion MIN_SUPPORTED_VERSION = SUPPORTED_VERSIONS[0];
     final static ProtocolVersion MAX_SUPPORTED_VERSION = SUPPORTED_VERSIONS[SUPPORTED_VERSIONS.length - 1];
 
@@ -74,8 +73,8 @@ public enum ProtocolVersion implements Comparable<ProtocolVersion>
     public final static EnumSet<ProtocolVersion> UNSUPPORTED = EnumSet.complementOf(SUPPORTED);
 
     /** The preferred versions */
-    public final static ProtocolVersion CURRENT = V5;
-    public final static Optional<ProtocolVersion> BETA = Optional.of(V6);
+    public final static ProtocolVersion CURRENT = V4;
+    public final static Optional<ProtocolVersion> BETA = Optional.of(V5);
 
     public static List<String> supportedVersions()
     {
@@ -85,7 +84,16 @@ public enum ProtocolVersion implements Comparable<ProtocolVersion>
         return ret;
     }
 
-    public static ProtocolVersion decode(int versionNum)
+    public static List<ProtocolVersion> supportedVersionsStartingWith(ProtocolVersion smallestVersion)
+    {
+        ArrayList<ProtocolVersion> versions = new ArrayList<>(SUPPORTED_VERSIONS.length);
+        for (ProtocolVersion version : SUPPORTED_VERSIONS)
+            if (version.isGreaterOrEqualTo(smallestVersion))
+                versions.add(version);
+        return versions;
+    }
+
+    public static ProtocolVersion decode(int versionNum, boolean allowOlderProtocols)
     {
         ProtocolVersion ret = versionNum >= MIN_SUPPORTED_VERSION.num && versionNum <= MAX_SUPPORTED_VERSION.num
                               ? SUPPORTED_VERSIONS[versionNum - MIN_SUPPORTED_VERSION.num]
@@ -106,6 +114,9 @@ public enum ProtocolVersion implements Comparable<ProtocolVersion>
             throw new ProtocolException(invalidVersionMessage(versionNum), MAX_SUPPORTED_VERSION);
         }
 
+        if (!allowOlderProtocols && ret.isSmallerThan(CURRENT))
+            throw new ProtocolException(String.format("Rejecting Protocol Version %s < %s.", ret, ProtocolVersion.CURRENT));
+
         return ret;
     }
 
@@ -123,6 +134,11 @@ public enum ProtocolVersion implements Comparable<ProtocolVersion>
     public int asInt()
     {
         return num;
+    }
+
+    public boolean supportsChecksums()
+    {
+        return num >= V5.asInt();
     }
 
     @Override

@@ -38,6 +38,7 @@ import org.junit.runners.Parameterized.Parameters;
 
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
+import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -75,9 +76,9 @@ import static org.junit.Assert.assertTrue;
 @RunWith(Parameterized.class)
 public abstract class CommitLogTest
 {
-    private static final String KEYSPACE1 = "CommitLogTest";
+    protected static final String KEYSPACE1 = "CommitLogTest";
     private static final String KEYSPACE2 = "CommitLogTestNonDurable";
-    private static final String STANDARD1 = "Standard1";
+    protected static final String STANDARD1 = "Standard1";
     private static final String STANDARD2 = "Standard2";
 
     private static JVMStabilityInspector.Killer oldKiller;
@@ -500,9 +501,9 @@ public abstract class CommitLogTest
         return Collections.singletonMap(EncryptionContext.ENCRYPTION_IV, Hex.bytesToHex(buf));
     }
 
-    protected File tmpFile(int version) throws IOException
+    protected File tmpFile(int version)
     {
-        File logFile = File.createTempFile("CommitLog-" + version + "-", ".log");
+        File logFile = FileUtils.createTempFile("CommitLog-" + version + "-", ".log");
         assert logFile.length() == 0;
         return logFile;
     }

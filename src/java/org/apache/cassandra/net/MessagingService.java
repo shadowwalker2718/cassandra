@@ -19,7 +19,6 @@ package org.apache.cassandra.net;
 
 import java.io.IOError;
 import java.io.IOException;
-import java.lang.management.ManagementFactory;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -35,9 +34,6 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-
-import javax.management.MBeanServer;
-import javax.management.ObjectName;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Function;
@@ -91,6 +87,7 @@ import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.locator.IEndpointSnitch;
 import org.apache.cassandra.locator.ILatencySubscriber;
 import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.Replica;
 import org.apache.cassandra.metrics.CassandraMetricsRegistry;
 import org.apache.cassandra.metrics.ConnectionMetrics;
 import org.apache.cassandra.metrics.DroppedMessageMetrics;
@@ -101,6 +98,7 @@ import org.apache.cassandra.net.async.NettyFactory.InboundInitializer;
 import org.apache.cassandra.repair.messages.RepairMessage;
 import org.apache.cassandra.schema.MigrationManager;
 import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.security.SSLFactory;
 import org.apache.cassandra.service.AbstractWriteResponseHandler;
 import org.apache.cassandra.service.StorageProxy;
 import org.apache.cassandra.service.StorageService;
@@ -111,6 +109,7 @@ import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.BooleanSerializer;
 import org.apache.cassandra.utils.ExpiringMap;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.MBeanWrapper;
 import org.apache.cassandra.utils.NativeLibrary;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.StatusLogger;
@@ -125,6 +124,7 @@ public final class MessagingService implements MessagingServiceMBean
     public static final int VERSION_30 = 10;
     public static final int VERSION_3014 = 11;
     public static final int VERSION_40 = 12;
+    public static final int minimum_version = VERSION_30;
     public static final int current_version = VERSION_40;
 
     public static final byte[] ONE_BYTE = new byte[1];
@@ -254,15 +254,29 @@ public final class MessagingService implements MessagingServiceMBean
                 return DatabaseDescriptor.getRangeRpcTimeout();
             }
         },
-        // remember to add new verbs at the end, since we serialize by ordinal
-        UNUSED_1,
+        PING
+        {
+            public long getTimeout()
+            {
+                return DatabaseDescriptor.getPingTimeout();
+            }
+        },
+
+        // UNUSED verbs were used as padding for backward/forward compatability before 4.0,
+        // but it wasn't quite as bullet/future proof as needed. We still need to keep these entries
+        // around, at least for a major rev or two (post-4.0). see CASSANDRA-13993 for a discussion.
+        // For now, though, the UNUSED are legacy values (placeholders, basically) that should only be used
+        // for correctly adding VERBs that need to be emergency additions to 3.0/3.11.
+        // We can reclaim them (their id's, to be correct) in future versions, if desireed, though.
         UNUSED_2,
         UNUSED_3,
         UNUSED_4,
         UNUSED_5,
+        _SAMPLE // dummy verb so we can use MS.droppedMessagesMap
         ;
+        // add new verbs after the existing verbs, since we serialize by ordinal.
 
-        private int id;
+        private final int id;
         Verb()
         {
             id = ordinal();
@@ -290,7 +304,11 @@ public final class MessagingService implements MessagingServiceMBean
         static
         {
             for (Verb v : values())
-                idToVerbMap.put(v.getId(), v);
+            {
+                Verb existing = idToVerbMap.put(v.getId(), v);
+                if (existing != null)
+                    throw new IllegalArgumentException("cannot have two verbs that map to the same id: " + v + " and " + existing);
+            }
         }
 
         public static Verb fromId(int id)
@@ -343,9 +361,12 @@ public final class MessagingService implements MessagingServiceMBean
         put(Verb.SNAPSHOT, Stage.MISC);
         put(Verb.ECHO, Stage.GOSSIP);
 
-        put(Verb.UNUSED_1, Stage.INTERNAL_RESPONSE);
         put(Verb.UNUSED_2, Stage.INTERNAL_RESPONSE);
         put(Verb.UNUSED_3, Stage.INTERNAL_RESPONSE);
+        put(Verb.UNUSED_4, Stage.INTERNAL_RESPONSE);
+        put(Verb.UNUSED_5, Stage.INTERNAL_RESPONSE);
+
+        put(Verb.PING, Stage.READ);
     }};
 
     /**
@@ -384,6 +405,7 @@ public final class MessagingService implements MessagingServiceMBean
         put(Verb.HINT, HintMessage.serializer);
         put(Verb.BATCH_STORE, Batch.serializer);
         put(Verb.BATCH_REMOVE, UUIDSerializer.serializer);
+        put(Verb.PING, PingMessage.serializer);
     }};
 
     /**
@@ -440,6 +462,20 @@ public final class MessagingService implements MessagingServiceMBean
         }
     }
 
+    public static IVersionedSerializer<?> getVerbSerializer(Verb verb, int id)
+    {
+        IVersionedSerializer serializer = verbSerializers.get(verb);
+        if (serializer instanceof MessagingService.CallbackDeterminedSerializer)
+        {
+            CallbackInfo callback = MessagingService.instance().getRegisteredCallback(id);
+            if (callback == null)
+                return null;
+
+            serializer = callback.serializer;
+        }
+        return serializer;
+    }
+
     /* Lookup table for registering message handlers based on the verb. */
     private final Map<Verb, IVerbHandler> verbHandlers;
 
@@ -458,6 +494,7 @@ public final class MessagingService implements MessagingServiceMBean
      * drop internal messages like bootstrap or repair notifications.
      */
     public static final EnumSet<Verb> DROPPABLE_VERBS = EnumSet.of(Verb._TRACE,
+                                                                   Verb._SAMPLE,
                                                                    Verb.MUTATION,
                                                                    Verb.COUNTER_MUTATION,
                                                                    Verb.HINT,
@@ -580,8 +617,9 @@ public final class MessagingService implements MessagingServiceMBean
 
                 if (expiredCallbackInfo.shouldHint())
                 {
-                    Mutation mutation = ((WriteCallbackInfo) expiredCallbackInfo).mutation();
-                    return StorageProxy.submitHint(mutation, expiredCallbackInfo.target, null);
+                    WriteCallbackInfo writeCallbackInfo = ((WriteCallbackInfo) expiredCallbackInfo);
+                    Mutation mutation = writeCallbackInfo.mutation();
+                    return StorageProxy.submitHint(mutation, writeCallbackInfo.getReplica(), null);
                 }
 
                 return null;
@@ -592,15 +630,7 @@ public final class MessagingService implements MessagingServiceMBean
 
         if (!testOnly)
         {
-            MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-            try
-            {
-                mbs.registerMBean(this, new ObjectName(MBEAN_NAME));
-            }
-            catch (Exception e)
-            {
-                throw new RuntimeException(e);
-            }
+            MBeanWrapper.instance.registerMBean(this, MBEAN_NAME);
         }
     }
 
@@ -726,7 +756,7 @@ public final class MessagingService implements MessagingServiceMBean
 
     public void listen()
     {
-        listen(DatabaseDescriptor.getServerEncryptionOptions());
+        listen(DatabaseDescriptor.getInternodeMessagingEncyptionOptions());
     }
 
     public void listen(ServerEncryptionOptions serverEncryptionOptions)
@@ -918,6 +948,14 @@ public final class MessagingService implements MessagingServiceMBean
     }
 
     /**
+     * SHOULD ONLY BE USED FOR TESTING!!
+     */
+    public void removeVerbHandler(Verb verb)
+    {
+        verbHandlers.remove(verb);
+    }
+
+    /**
      * This method returns the verb handler associated with the registered
      * verb. If no handler has been registered then null is returned.
      *
@@ -929,7 +967,7 @@ public final class MessagingService implements MessagingServiceMBean
         return verbHandlers.get(type);
     }
 
-    public int addCallback(IAsyncCallback cb, MessageOut message, InetAddressAndPort to, long timeout, boolean failureCallback)
+    public int addWriteCallback(IAsyncCallback cb, MessageOut message, InetAddressAndPort to, long timeout, boolean failureCallback)
     {
         assert message.verb != Verb.MUTATION; // mutations need to call the overload with a ConsistencyLevel
         int messageId = nextId();
@@ -938,12 +976,12 @@ public final class MessagingService implements MessagingServiceMBean
         return messageId;
     }
 
-    public int addCallback(IAsyncCallback cb,
-                           MessageOut<?> message,
-                           InetAddressAndPort to,
-                           long timeout,
-                           ConsistencyLevel consistencyLevel,
-                           boolean allowHints)
+    public int addWriteCallback(IAsyncCallback cb,
+                                MessageOut<?> message,
+                                Replica to,
+                                long timeout,
+                                ConsistencyLevel consistencyLevel,
+                                boolean allowHints)
     {
         assert message.verb == Verb.MUTATION
             || message.verb == Verb.COUNTER_MUTATION
@@ -992,7 +1030,7 @@ public final class MessagingService implements MessagingServiceMBean
      */
     public int sendRR(MessageOut message, InetAddressAndPort to, IAsyncCallback cb, long timeout, boolean failureCallback)
     {
-        int id = addCallback(cb, message, to, timeout, failureCallback);
+        int id = addWriteCallback(cb, message, to, timeout, failureCallback);
         updateBackPressureOnSend(to, cb, message);
         sendOneWay(failureCallback ? message.withParameter(ParameterType.FAILURE_CALLBACK, ONE_BYTE) : message, id, to);
         return id;
@@ -1010,14 +1048,14 @@ public final class MessagingService implements MessagingServiceMBean
      *                suggest that a timeout occurred to the invoker of the send().
      * @return an reference to message id used to match with the result
      */
-    public int sendRR(MessageOut<?> message,
-                      InetAddressAndPort to,
-                      AbstractWriteResponseHandler<?> handler,
-                      boolean allowHints)
+    public int sendWriteRR(MessageOut<?> message,
+                           Replica to,
+                           AbstractWriteResponseHandler<?> handler,
+                           boolean allowHints)
     {
-        int id = addCallback(handler, message, to, message.getTimeout(), handler.consistencyLevel, allowHints);
-        updateBackPressureOnSend(to, handler, message);
-        sendOneWay(message.withParameter(ParameterType.FAILURE_CALLBACK, ONE_BYTE), id, to);
+        int id = addWriteCallback(handler, message, to, message.getTimeout(), handler.consistencyLevel(), allowHints);
+        updateBackPressureOnSend(to.endpoint(), handler, message);
+        sendOneWay(message.withParameter(ParameterType.FAILURE_CALLBACK, ONE_BYTE), id, to.endpoint());
         return id;
     }
 
@@ -1583,6 +1621,16 @@ public final class MessagingService implements MessagingServiceMBean
                                                    bounds.left.getPartitioner().getClass().getName()));
     }
 
+    /**
+     * This method is used to determine the preferred IP & Port of a peer using the
+     * {@link OutboundMessagingPool} and SystemKeyspace.
+     */
+    public InetAddressAndPort getPreferredRemoteAddr(InetAddressAndPort to)
+    {
+        OutboundMessagingPool pool = channelManagers.get(to);
+        return pool != null ? pool.getPreferredRemoteAddr() : SystemKeyspace.getPreferredIP(to);
+    }
+
     private OutboundMessagingPool getMessagingConnection(InetAddressAndPort to)
     {
         OutboundMessagingPool pool = channelManagers.get(to);
@@ -1594,8 +1642,8 @@ public final class MessagingService implements MessagingServiceMBean
                 return null;
 
             InetAddressAndPort preferredRemote = SystemKeyspace.getPreferredIP(to);
-            InetAddressAndPort local = FBUtilities.getLocalAddressAndPort();
-            ServerEncryptionOptions encryptionOptions = secure ? DatabaseDescriptor.getServerEncryptionOptions() : null;
+            InetAddressAndPort local = FBUtilities.getBroadcastAddressAndPort();
+            ServerEncryptionOptions encryptionOptions = secure ? DatabaseDescriptor.getInternodeMessagingEncyptionOptions() : null;
             IInternodeAuthenticator authenticator = DatabaseDescriptor.getInternodeAuthenticator();
 
             pool = new OutboundMessagingPool(preferredRemote, local, encryptionOptions, backPressure.newState(to), authenticator);
@@ -1645,23 +1693,29 @@ public final class MessagingService implements MessagingServiceMBean
     public static boolean isEncryptedConnection(InetAddressAndPort address)
     {
         IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();
-        switch (DatabaseDescriptor.getServerEncryptionOptions().internode_encryption)
+        switch (DatabaseDescriptor.getInternodeMessagingEncyptionOptions().internode_encryption)
         {
             case none:
                 return false; // if nothing needs to be encrypted then return immediately.
             case all:
                 break;
             case dc:
-                if (snitch.getDatacenter(address).equals(snitch.getDatacenter(FBUtilities.getBroadcastAddressAndPort())))
+                if (snitch.getDatacenter(address).equals(snitch.getLocalDatacenter()))
                     return false;
                 break;
             case rack:
                 // for rack then check if the DC's are the same.
-                if (snitch.getRack(address).equals(snitch.getRack(FBUtilities.getBroadcastAddressAndPort()))
-                    && snitch.getDatacenter(address).equals(snitch.getDatacenter(FBUtilities.getBroadcastAddressAndPort())))
+                if (snitch.getRack(address).equals(snitch.getLocalRack())
+                    && snitch.getDatacenter(address).equals(snitch.getLocalDatacenter()))
                     return false;
                 break;
         }
         return true;
+    }
+
+    @Override
+    public void reloadSslCertificates()
+    {
+        SSLFactory.checkCertFilesForHotReloading();
     }
 }

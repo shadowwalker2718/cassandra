@@ -19,8 +19,6 @@
 package org.apache.cassandra.net.async;
 
 import java.io.IOException;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
 import java.util.Optional;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -323,6 +321,9 @@ public class OutboundMessagingConnection
                              ? DatabaseDescriptor.getInternodeSendBufferSize()
                              : OutboundConnectionParams.DEFAULT_SEND_BUFFER_SIZE;
 
+        int tcpConnectTimeout = DatabaseDescriptor.getInternodeTcpConnectTimeoutInMS();
+        int tcpUserTimeout = DatabaseDescriptor.getInternodeTcpUserTimeoutInMS();
+
         OutboundConnectionParams params = OutboundConnectionParams.builder()
                                                                   .connectionId(connectionId)
                                                                   .callback(this::finishHandshake)
@@ -332,6 +333,8 @@ public class OutboundMessagingConnection
                                                                   .coalescingStrategy(coalescingStrategy)
                                                                   .sendBufferSize(sendBufferSize)
                                                                   .tcpNoDelay(tcpNoDelay)
+                                                                  .tcpConnectTimeoutInMS(tcpConnectTimeout)
+                                                                  .tcpUserTimeoutInMS(tcpUserTimeout)
                                                                   .backlogSupplier(() -> nextBackloggedMessage())
                                                                   .messageResultConsumer(this::handleMessageResult)
                                                                   .protocolVersion(targetVersion)
@@ -479,7 +482,7 @@ public class OutboundMessagingConnection
         {
             case SUCCESS:
                 assert result.channelWriter != null;
-                logger.debug("successfully connected to {}, conmpress = {}, coalescing = {}", connectionId,
+                logger.debug("successfully connected to {}, compress = {}, coalescing = {}", connectionId,
                              shouldCompressConnection(connectionId.local(), connectionId.remote()),
                              coalescingStrategy.isPresent() ? coalescingStrategy.get() : CoalescingStrategies.Strategy.DISABLED);
                 if (state.get() == State.CLOSED)
