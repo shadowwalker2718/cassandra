@@ -567,5 +567,11 @@ public class Config
         }
 
         logger.info("Node configuration:[{}]", Joiner.on("; ").join(configMap.entrySet()));
+        for(Map.Entry<String,String> entry : configMap.entrySet()) {
+            String key = entry.getKey();
+            String value = entry.getValue();
+
+            logger.info(key + " => " + value);
+        }
     }
 }
